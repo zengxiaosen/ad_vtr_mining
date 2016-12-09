@@ -1,8 +1,14 @@
 package application.advtr.controler
 
+
+import application.advtr.estimator.LogisticSGDEstimator
+import application.advtr.pipeline.PipelineStageExecutor
 import application.advtr.sample.handler._
 import application.advtr.sample.{VTRSampleConfig, VTRSampleMaker}
+import application.advtr.transformer.{DataInstance2SampleTransformer, PlainText2DataInstanceTransformer, Sample2LabeledPointTransformer}
 import com.esotericsoftware.kryo.Kryo
+import commons.framework.estimate.SparkEstimate
+import commons.framework.transform.SparkTransform
 import model.XgboostTreeModel
 import org.apache.spark.SparkContext
 import org.apache.spark.mllib.regression.LabeledPoint
@@ -25,16 +31,73 @@ object VTR4RTBPredictControler{
   var parentPath = ""
   var sc: SparkContext = _
 
-  def runETLAndTrainByLogisticSGD(inputPath: String, formatDataOutputPath: String, modelPatch: String, testResultPath: String, local_analyzePath: String): Unit ={
+  def runETLAndTrainByLogisticSGD(inputPath: String, formatDataOutputPath: String, modelPath: String, testResultPath: String, local_analyzePath: String): Unit ={
     val training = sc.textFile(inputPath)//.coalesce(840,true)
     //val training = sc.textFile("file:///opt/ssy/workspace/vtr/data/orgSample/*")//.coaleasce(840.true)
     //feature handler register
     val featureIndex = init()
     val sampleMaker = VTRSampleMaker.instance
 
-    val dataInstanceTransformer = new
+    val dataInstanceTransformer = new PlainText2DataInstanceTransformer()
+    dataInstanceTransformer.inputRDD = training
+    val sampleTransformer = new DataInstance2SampleTransformer(sampleMaker)
+    val labeledPointTransformer = new Sample2LabeledPointTransformer(featureIndex)//featureIndex + 1\
+    val transformers = Array[SparkTransform](dataInstanceTransformer, sampleTransformer, labeledPointTransformer)
 
+    val logisticSGDEstimator = new LogisticSGDEstimator()
+    val estimators = Array[SparkEstimate](logisticSGDEstimator)
+    val pipeline = new PipelineStageExecutor(transformers,estimators)
+    pipeline.execTransformers()//exec transformer
+    sampleTransformer.outputRDD.saveAsTextFile(formatDataOutputPath)//save sample formatted training text
+    pipeline.execEstimators()
+    //handle model and related result
+    logisticSGDEstimator.analyzeResult(local_analyzePath)
 
+    if(logisticSGDEstimator.bestTestResultRDD != null){
+      logisticSGDEstimator.bestTestResultRDD.saveAsTextFile(testResultPath)
+      logisticSGDEstimator.bestTestResultRDD.unpersist()
+    }
+
+    if(logisticSGDEstimator.bestModel != null){
+      val weightsStr = "weigths: " + logisticSGDEstimator.bestModel.weights.toArray.mkString(",")
+      val thresholdStr = "threshold: " + logisticSGDEstimator.bestModel.getThreshold
+      val interceptStr = "intercept: " + logisticSGDEstimator.bestModel.intercept
+      sc.parallelize(Array(weightsStr, thresholdStr, interceptStr), 1).saveAsTextFile(modelPath)
+    }
+  }
+
+  def runETLAndPredictByLogisticSGD(predictDataPath: String, formatDataOutPath: String, modelPath: String, testResultPath: String, local_analyzePath: String): Unit ={
+    val predictData = sc.textFile(predictDataPath)
+
+    //feature handler register
+    val featureIndex = init()
+    val sampleMaker = VTRSampleMaker.instance
+
+    val dataInstanceTransformer = new PlainText2DataInstanceTransformer()
+    dataInstanceTransformer.inputRDD = predictData
+    val sampleTransformer = new DataInstance2SampleTransformer(sampleMaker)
+    val labeledPointTransformer = new Sample2LabeledPointTransformer(featureIndex)// featureIndex + 1
+    val transformers = Array[SparkTransform](dataInstanceTransformer, sampleTransformer, labeledPointTransformer)
+
+    //val predictData = MLUtils.loadLibSVMFile(sc, formatDataOutPath)
+
+    val logisticSGDEstimator = new LogisticSGDEstimator(isPredict = true)
+    ;//logisticSGDEstimator.originRDD = predictData
+    val modelData = sc.textFile(modelPath, 1)
+    val weightsStr = modelData.filter(_.startsWith("weights")).first().split(":")(1)
+    val intercept = modelData.filter(_.startsWith("intercept")).first().split(":")(1).toDouble
+    logisticSGDEstimator.createModel(weightsStr,intercept)
+    val estimators = Array[SparkEstimate](logisticSGDEstimator)
+
+    val pipeline = new PipelineStageExecutor(transformers,estimators)
+    pipeline.execTransformers()//exec transformer
+    sampleTransformer.outputRDD.saveAsTextFile(formatDataOutPath)
+    pipeline.execEstimators()
+    pipeline.unCacheRDD()
+
+    if(logisticSGDEstimator.bestTestResultRDD != null){
+      logisticSGDEstimator.bestTestResultRDD.saveAsTextFile(testResultPath)
+    }
   }
 
   def init(): Int = {
